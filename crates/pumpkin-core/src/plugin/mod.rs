@@ -1371,10 +1371,11 @@ impl PluginManager {
     pub fn register_dyn(&self, event_type: &'static str, handler: &Arc<dyn DynEventHandler>) {
         self.handlers.rcu(|handlers| {
             let mut new_handlers = (**handlers).clone();
-            new_handlers
-                .entry(event_type)
-                .or_default()
-                .push(handler.clone());
+            let event_handlers = new_handlers.entry(event_type).or_default();
+            event_handlers.push(handler.clone());
+            // Lowest runs first so higher priorities get the final say. The sort is
+            // stable, so equal priorities keep their registration order.
+            event_handlers.sort_by_key(|handler| std::cmp::Reverse(handler.get_priority().clone()));
             Arc::new(new_handlers)
         });
     }
@@ -1758,6 +1759,60 @@ mod tests {
                 .unwrap()
                 .tick,
             2
+        );
+    }
+
+    struct PriorityProbe {
+        name: &'static str,
+        priority: EventPriority,
+    }
+
+    impl DynEventHandler for PriorityProbe {
+        fn handle_dyn<'a>(
+            &'a self,
+            _server: &'a Arc<Server>,
+            _event: QueuedEvent,
+        ) -> BoxFuture<'a, ()> {
+            Box::pin(async {})
+        }
+
+        fn is_blocking(&self) -> bool {
+            true
+        }
+
+        fn get_priority(&self) -> &EventPriority {
+            &self.priority
+        }
+
+        fn source(&self) -> Option<&str> {
+            Some(self.name)
+        }
+    }
+
+    // Handlers used to run in registration order, so `EventPriority` had no effect.
+    #[test]
+    fn handlers_run_from_lowest_to_highest_priority() {
+        let manager = PluginManager::new(Vec::new());
+        for (name, priority) in [
+            ("normal-a", EventPriority::Normal),
+            ("highest", EventPriority::Highest),
+            ("lowest", EventPriority::Lowest),
+            ("normal-b", EventPriority::Normal),
+            ("low", EventPriority::Low),
+            ("high", EventPriority::High),
+        ] {
+            let handler: Arc<dyn DynEventHandler> = Arc::new(PriorityProbe { name, priority });
+            manager.register_dyn(ServerTickStartEvent::get_name_static(), &handler);
+        }
+
+        let handlers = manager.handlers.load();
+        let order: Vec<_> = handlers[ServerTickStartEvent::get_name_static()]
+            .iter()
+            .filter_map(|handler| handler.source())
+            .collect();
+        assert_eq!(
+            order,
+            ["lowest", "low", "normal-a", "normal-b", "high", "highest"]
         );
     }
 
