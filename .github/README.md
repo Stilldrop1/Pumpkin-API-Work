@@ -7,8 +7,6 @@ This repository builds on [Pumpkin](https://github.com/Pumpkin-MC/Pumpkin) pull 
 **[See only our changes compared to PR #4609 →](https://github.com/Stilldrop1/Pumpkin-API-Work/compare/upstream-pr-4609...main)**
 
 > Not an official Pumpkin project. It's an independent proposal, shared for review and discussion.
-> It was written with help from an AI agent (Claude Code), so please check its claims against the code.
-
 ---
 
 ## At a glance
