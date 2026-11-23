@@ -181,7 +181,7 @@ mod resource_with {
     use pumpkin_core::{
         command::CommandSender,
         entity::{EntityBase, player::Player},
-        plugin::{Context, QueuedEvent, api::gui::PluginGui},
+        plugin::{Context, api::gui::PluginGui},
         server::{RecipeManager, Server},
         world::World,
     };
@@ -476,7 +476,7 @@ mod resource_with {
     }
 
     impl FromResource for plugin::event::Event {
-        type Internal = QueuedEvent;
+        type Internal = crate::events::WasmEventState;
     }
 }
 

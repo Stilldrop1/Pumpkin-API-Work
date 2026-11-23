@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{any::Any, sync::Arc};
 
 use pumpkin_data::{Block, entity::EntityType};
 use pumpkin_inventory::screen_handler::ClickType;
@@ -35,44 +35,119 @@ pub use cleanup::*;
 
 impl pumpkin::plugin::event::Host for PluginHostState {}
 
+/// Host state behind the `event` resource lent to one Wasm handler call.
+///
+/// Setters edit a private copy. The copy replaces the shared event only after the
+/// guest returns successfully, so a handler that traps leaves the event untouched.
+pub struct WasmEventState {
+    handle: QueuedEvent,
+    staged: Option<Box<dyn StagedEvent>>,
+}
+
+impl WasmEventState {
+    const fn new(handle: QueuedEvent) -> Self {
+        Self {
+            handle,
+            staged: None,
+        }
+    }
+}
+
+trait StagedEvent: Send + Sync {
+    fn as_any(&self) -> &dyn Any;
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+    /// Writes the copy back. Returns `false` if the event is no longer live.
+    fn commit(self: Box<Self>, handle: QueuedEvent) -> BoxFuture<'static, bool>;
+}
+
+struct Staged<E>(E);
+
+impl<E: Payload + 'static> StagedEvent for Staged<E> {
+    fn as_any(&self) -> &dyn Any {
+        &self.0
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        &mut self.0
+    }
+
+    fn commit(self: Box<Self>, handle: QueuedEvent) -> BoxFuture<'static, bool> {
+        Box::pin(async move {
+            let Some(mut live) = handle.write_async::<E>().await else {
+                return false;
+            };
+            *live = self.0;
+            true
+        })
+    }
+}
+
 fn get_event_inner<E: Payload + ToFromWasmEvent + 'static>(
     state: &mut PluginHostState,
     event: &Resource<WasmEvent>,
 ) -> wasmtime::Result<Result<E::Wit, ()>> {
-    let handle = state.get(event)?.clone();
+    let entry = state.get_mut(event)?;
+    // Reads see this handler's own staged edits.
+    if let Some(staged) = entry.staged.take() {
+        let result = staged
+            .as_any()
+            .downcast_ref::<E>()
+            .map(|value| value.to_wasm_event(state))
+            .ok_or(());
+        state.get_mut(event)?.staged = Some(staged);
+        return Ok(result);
+    }
+
+    let handle = entry.handle.clone();
     let Some(value) = handle.read::<E>()? else {
         return Ok(Err(()));
     };
     Ok(Ok(value.to_wasm_event(state)))
 }
 
-fn set_event_inner<E: Payload + ToFromWasmEvent + 'static>(
+fn set_event_inner<E: Payload + ToFromWasmEvent + Clone + 'static>(
     state: &mut PluginHostState,
     event: &Resource<WasmEvent>,
     data: E::Wit,
 ) -> wasmtime::Result<Result<(), ()>> {
-    let handle = match state.get(event) {
-        Ok(handle) => handle.clone(),
+    let (handle, staged) = match state.get_mut(event) {
+        Ok(entry) => (entry.handle.clone(), entry.staged.take()),
         Err(error) => {
             data.cleanup_event(state);
             return Err(error);
         }
     };
 
-    match handle.write::<E>() {
-        Ok(Some(mut value)) => {
-            value.apply_wasm_event(data, state);
-            Ok(Ok(()))
-        }
-        Ok(None) => {
-            data.cleanup_event(state);
-            Ok(Err(()))
-        }
-        Err(error) => {
-            data.cleanup_event(state);
-            Err(error.into())
-        }
-    }
+    let mut staged = if let Some(staged) = staged {
+        staged
+    } else {
+        // `write` also rejects notifications, which may not edit the event.
+        let copy = match handle
+            .write::<E>()
+            .map(|live| live.map(|live| E::clone(&live)))
+        {
+            Ok(Some(copy)) => copy,
+            Ok(None) => {
+                data.cleanup_event(state);
+                return Ok(Err(()));
+            }
+            Err(error) => {
+                data.cleanup_event(state);
+                return Err(error.into());
+            }
+        };
+        Box::new(Staged(copy))
+    };
+
+    let result = if let Some(value) = staged.as_any_mut().downcast_mut::<E>() {
+        value.apply_wasm_event(data, state);
+        Ok(())
+    } else {
+        data.cleanup_event(state);
+        Err(())
+    };
+    state.get_mut(event)?.staged = Some(staged);
+    Ok(result)
 }
 
 macro_rules! impl_event_getter_setter {
@@ -1686,9 +1761,12 @@ impl DynEventHandler for WasmPluginEventHandler {
                 .instance::<crate::Plugin>()
                 .func_handle_event()
                 .func();
+            let handle = event.clone();
             let result = self.plugin.store.call_guest(move |mut guest| {
                 Box::pin(async move {
-                    let owned = guest.with(|mut store| store.data_mut().add::<WasmEvent>(event))?;
+                    let owned = guest.with(|mut store| {
+                        store.data_mut().add::<WasmEvent>(WasmEventState::new(event))
+                    })?;
                     let server_resource = guest.with(|mut store| store.data_mut().add(server));
                     let result = match server_resource {
                         Ok(server) => {
@@ -1699,15 +1777,27 @@ impl DynEventHandler for WasmPluginEventHandler {
                         }
                         Err(error) => Err(error),
                     };
-                    let cleanup = guest.with(|mut store| store.data_mut().drop(owned));
+                    let cleanup = guest.with(|mut store| store.data_mut().take(owned));
                     if let Err(error) = &cleanup {
                         tracing::error!(handler_id, %error, "Failed to remove Wasm event resource");
                     }
-                    result.and(cleanup)
+                    // A failed call discards its staged edits.
+                    result.and(cleanup).map(|state| state.staged)
                 })
             }).await;
-            if let Err(error) = result {
-                tracing::error!(handler_id, %error, "Wasm event dispatch failed");
+            match result {
+                Ok(Some(staged)) => {
+                    if !staged.commit(handle).await {
+                        tracing::warn!(
+                            handler_id,
+                            "Wasm event edits were dropped because the event ended"
+                        );
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::error!(handler_id, %error, "Wasm event dispatch failed");
+                }
             }
         })
     }
