@@ -1375,7 +1375,7 @@ impl PluginManager {
             event_handlers.push(handler.clone());
             // Lowest runs first so higher priorities get the final say. The sort is
             // stable, so equal priorities keep their registration order.
-            event_handlers.sort_by_key(|handler| std::cmp::Reverse(handler.get_priority().clone()));
+            event_handlers.sort_by_key(|handler| std::cmp::Reverse(*handler.get_priority()));
             Arc::new(new_handlers)
         });
     }
@@ -1399,9 +1399,9 @@ impl PluginManager {
     ) -> E {
         let slot = Arc::new(RwLock::new(EventCell::new(event)));
 
+        // Only dispatch changes the generation, so it is tracked here instead of re-read.
+        let mut generation = 0;
         for handler in handlers.iter().filter(|handler| handler.is_blocking()) {
-            let generation = slot.read().await.generation;
-
             handler
                 .handle_dyn(
                     server,
@@ -1413,10 +1413,9 @@ impl PluginManager {
                 )
                 .await;
 
-            slot.write().await.generation += 1;
+            generation += 1;
+            slot.write().await.generation = generation;
         }
-
-        let generation = slot.read().await.generation;
 
         join_all(
             handlers
@@ -1436,6 +1435,11 @@ impl PluginManager {
         )
         .await;
 
+        // With no handle left alive, the event can be moved out without locking.
+        let slot = match Arc::try_unwrap(slot) {
+            Ok(cell) => return cell.into_inner().event.expect("dispatch owns the event"),
+            Err(slot) => slot,
+        };
         let mut slot_guard = slot.write().await;
 
         slot_guard.generation += 1;

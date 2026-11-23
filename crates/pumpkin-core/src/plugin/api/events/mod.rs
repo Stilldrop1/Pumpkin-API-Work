@@ -129,7 +129,7 @@ pub trait Cancellable: Send + Sync {
 ///
 /// Events with lower priority values are executed first, allowing higher priority events
 /// to override their changes.
-#[derive(Debug, Eq, PartialEq, Ord, PartialOrd, Clone)]
+#[derive(Debug, Eq, PartialEq, Ord, PartialOrd, Clone, Copy)]
 pub enum EventPriority {
     /// Highest priority level.
     Highest,
