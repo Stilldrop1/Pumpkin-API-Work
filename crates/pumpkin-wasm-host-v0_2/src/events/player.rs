@@ -255,6 +255,18 @@ impl ToFromWasmEvent for InventoryClickEvent {
             cancelled: data.cancelled,
         }
     }
+
+    // The stacks are read-only copies, so an edit keeps the originals instead of
+    // clearing them, and releases the handles the plugin sent back.
+    fn apply_wasm_event(&mut self, data: Self::Wit, state: &mut PluginHostState) {
+        data.cleanup_event(state);
+        self.window_type = data.window_type.map(from_wit_screen);
+        self.click_type = from_wasm_click_type(data.click_type);
+        self.slot = data.slot;
+        self.raw_slot = data.raw_slot;
+        self.hotbar_button = data.hotbar_button;
+        self.cancelled = data.cancelled;
+    }
 }
 
 impl ToFromWasmEvent for PlayerJoinEvent {

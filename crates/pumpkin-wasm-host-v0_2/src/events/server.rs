@@ -360,6 +360,13 @@ impl ToFromWasmEvent for ServerListPingEvent {
         }
     }
 
+    // The hostname and address describe the incoming connection and cannot be changed.
+    fn accepts_wasm_edit(&self, data: &Self::Wit, _state: &PluginHostState) -> bool {
+        data.hostname == self.hostname()
+            && data.address.host == self.address().host()
+            && data.address.port == self.address().port()
+    }
+
     fn apply_wasm_event(&mut self, data: Self::Wit, state: &mut PluginHostState) {
         let returned = Self::from_wasm_event(data, state);
         self.motd = returned.motd;
@@ -490,6 +497,34 @@ mod tests {
                 .get::<TextComponent>(&Resource::new_own(motd_rep))
                 .is_err()
         );
+    }
+
+    // Edits to the connection's hostname or address used to be dropped while the
+    // setter still reported success.
+    #[test]
+    fn server_list_ping_rejects_hostname_and_address_edits() {
+        let mut state = PluginHostState::new();
+        let event = ServerListPingEvent::new(
+            "original.example".to_string(),
+            "127.0.0.1:25565"
+                .parse()
+                .expect("test address should parse"),
+            TextComponent::text("Original"),
+            20,
+            1,
+            None,
+        );
+        let mut data = event.to_wasm_event(&mut state);
+
+        data.max_players = 40;
+        assert!(event.accepts_wasm_edit(&data, &state));
+
+        data.hostname = "replacement.example".to_string();
+        assert!(!event.accepts_wasm_edit(&data, &state));
+
+        data.hostname = "original.example".to_string();
+        data.address.port = 25_566;
+        assert!(!event.accepts_wasm_edit(&data, &state));
     }
 
     const ACCEPT_TELEPORTATION_26_3: [u8; 33] = [

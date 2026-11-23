@@ -4,7 +4,8 @@ use tokio::sync::Mutex;
 use crate::{
     events::{
         CleanupEvent, ToFromWasmEvent, consume_player, consume_text_component, consume_world,
-        from_wasm_block_position, from_wasm_position, to_wasm_block_position, to_wasm_position,
+        from_wasm_block_position, from_wasm_position, take_item_stack, to_wasm_block_position,
+        to_wasm_position,
     },
     living_entity::{from_wit_damage_type, to_wit_damage_type},
     pumpkin::plugin::event::{
@@ -1370,8 +1371,25 @@ impl ToFromWasmEvent for PiglinBarterEvent {
         }
     }
 
+    // Plugins may replace the outcome. Each stack handle must be live and sent once,
+    // so `apply_wasm_event` can take all of them.
+    fn accepts_wasm_edit(&self, data: &Self::Wit, state: &PluginHostState) -> bool {
+        let mut seen = std::collections::HashSet::new();
+        data.entity_id == self.entity_id
+            && data.outcome.iter().all(|stack| {
+                seen.insert(stack.rep())
+                    && state.get(stack).is_ok_and(|stack| stack.try_lock().is_ok())
+            })
+    }
+
+    // The input item was already handed over, so it stays read-only.
     fn apply_wasm_event(&mut self, data: Self::Wit, state: &mut PluginHostState) {
-        data.cleanup_event(state);
+        self.outcome = data
+            .outcome
+            .iter()
+            .filter_map(|stack| take_item_stack(state, stack))
+            .collect();
+        state.discard_to_be_removed(&data.input_item);
         self.cancelled = data.cancelled;
     }
 
@@ -2215,5 +2233,84 @@ impl ToFromWasmEvent for VillagerReputationChangeEvent {
             reputation_change: data.reputation_change,
             cancelled: data.cancelled,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pumpkin_data::item::Item;
+    use pumpkin_data::item_stack::ItemStack;
+    use wasmtime::component::Resource;
+
+    fn add_stack(
+        state: &mut PluginHostState,
+        stack: ItemStack,
+    ) -> Resource<crate::pumpkin::plugin::item_stack::ItemStack> {
+        state
+            .add(Arc::new(Mutex::new(stack)))
+            .expect("item stack resource should be inserted")
+    }
+
+    // Outcome edits used to be dropped while the setter still reported success,
+    // even though the piglin throws whatever the event's outcome holds.
+    #[test]
+    fn piglin_barter_applies_outcome_and_releases_handles() {
+        let mut state = PluginHostState::new();
+        let mut event = PiglinBarterEvent::new(
+            7,
+            ItemStack::new(1, &Item::GOLD_INGOT),
+            vec![ItemStack::new(1, &Item::ENDER_PEARL)],
+        );
+        let input_item = add_stack(&mut state, ItemStack::new(1, &Item::GOLD_INGOT));
+        let outcome = add_stack(&mut state, ItemStack::new(3, &Item::STRING));
+        let reps = [input_item.rep(), outcome.rep()];
+        let data = PiglinBarterEventData {
+            entity_id: 7,
+            input_item,
+            outcome: vec![outcome],
+            cancelled: false,
+        };
+
+        assert!(event.accepts_wasm_edit(&data, &state));
+        event.apply_wasm_event(data, &mut state);
+
+        assert_eq!(event.outcome.len(), 1);
+        assert_eq!(event.outcome[0].item, &Item::STRING);
+        assert_eq!(event.outcome[0].item_count, 3);
+        assert_eq!(event.input_item.item, &Item::GOLD_INGOT);
+        for rep in reps {
+            assert!(
+                state
+                    .resource_table
+                    .get::<Arc<Mutex<ItemStack>>>(&Resource::new_own(rep))
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn piglin_barter_rejects_invalid_outcome_handles() {
+        let mut state = PluginHostState::new();
+        let event = PiglinBarterEvent::new(7, ItemStack::new(1, &Item::GOLD_INGOT), Vec::new());
+        let input_item = add_stack(&mut state, ItemStack::new(1, &Item::GOLD_INGOT));
+        let stack = add_stack(&mut state, ItemStack::new(1, &Item::STRING));
+        let mut data = PiglinBarterEventData {
+            entity_id: 7,
+            input_item,
+            outcome: vec![
+                Resource::new_own(stack.rep()),
+                Resource::new_own(stack.rep()),
+            ],
+            cancelled: false,
+        };
+        assert!(!event.accepts_wasm_edit(&data, &state));
+
+        data.outcome = vec![Resource::new_own(u32::MAX)];
+        assert!(!event.accepts_wasm_edit(&data, &state));
+
+        data.outcome = vec![stack];
+        data.entity_id = 8;
+        assert!(!event.accepts_wasm_edit(&data, &state));
     }
 }

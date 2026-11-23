@@ -1,12 +1,13 @@
 use std::{any::Any, sync::Arc};
 
-use pumpkin_data::{Block, entity::EntityType};
+use pumpkin_data::{Block, entity::EntityType, item_stack::ItemStack};
 use pumpkin_inventory::screen_handler::ClickType;
 use pumpkin_protocol::java::server::play::ActionType;
 use pumpkin_util::{
     GameMode, Hand,
     math::{position::BlockPos, vector3::Vector3},
 };
+use tokio::sync::Mutex;
 use wasmtime::component::Resource;
 
 use crate::pumpkin::{self, plugin::event::Event as WasmEvent};
@@ -139,12 +140,15 @@ fn set_event_inner<E: Payload + ToFromWasmEvent + Clone + 'static>(
         Box::new(Staged(copy))
     };
 
-    let result = if let Some(value) = staged.as_any_mut().downcast_mut::<E>() {
-        value.apply_wasm_event(data, state);
-        Ok(())
-    } else {
-        data.cleanup_event(state);
-        Err(())
+    let result = match staged.as_any_mut().downcast_mut::<E>() {
+        Some(value) if value.accepts_wasm_edit(&data, state) => {
+            value.apply_wasm_event(data, state);
+            Ok(())
+        }
+        _ => {
+            data.cleanup_event(state);
+            Err(())
+        }
     };
     state.get_mut(event)?.staged = Some(staged);
     Ok(result)
@@ -1581,6 +1585,12 @@ pub trait ToFromWasmEvent {
 
     fn from_wasm_event(event: Self::Wit, state: &mut PluginHostState) -> Self;
 
+    /// Returns `false` if `event` changes something the host cannot apply, so the
+    /// setter can reject the edit instead of dropping it while reporting success.
+    fn accepts_wasm_edit(&self, _event: &Self::Wit, _state: &PluginHostState) -> bool {
+        true
+    }
+
     fn apply_wasm_event(&mut self, event: Self::Wit, state: &mut PluginHostState)
     where
         Self: Sized,
@@ -1717,6 +1727,22 @@ pub(super) const fn from_wasm_click_type(click_type: pumpkin::plugin::gui::Click
         pumpkin::plugin::gui::ClickType::NumberKey => ClickType::NumberKey(0), // Default to 0
         pumpkin::plugin::gui::ClickType::Unknown => ClickType::Unknown,
     }
+}
+
+/// Removes an item stack resource a plugin handed back and returns its stack.
+///
+/// Returns `None` if the handle is not a live item stack, so callers can reject
+/// plugin input instead of panicking on it.
+pub(super) fn take_item_stack(
+    state: &mut PluginHostState,
+    item: &Resource<pumpkin::plugin::item_stack::ItemStack>,
+) -> Option<ItemStack> {
+    let stack = state
+        .resource_table
+        .delete::<Arc<Mutex<ItemStack>>>(Resource::new_own(item.rep()))
+        .ok()?;
+    let stack = stack.try_lock().ok()?.clone();
+    Some(stack)
 }
 
 pub(super) fn consume_player(

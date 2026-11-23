@@ -4,7 +4,7 @@ use tokio::sync::Mutex;
 use wasmtime::component::Resource;
 
 use crate::{
-    events::{ToFromWasmEvent, consume_player},
+    events::{ToFromWasmEvent, consume_player, take_item_stack},
     item_stack::{from_wit_enchantment, to_wit_enchantment},
     pumpkin::plugin::event::{
         EnchantItemEvent as EnchantItemEventData, EnchantmentOffer,
@@ -21,11 +21,7 @@ fn consume_item_stack(
     state: &mut PluginHostState,
     item: &Resource<crate::pumpkin::plugin::item_stack::ItemStack>,
 ) -> ItemStack {
-    let mutex = state
-        .resource_table
-        .delete::<Arc<Mutex<ItemStack>>>(Resource::new_own(item.rep()))
-        .expect("invalid item stack resource handle");
-    mutex.try_lock().expect("lock item stack").clone()
+    take_item_stack(state, item).expect("invalid item stack resource handle")
 }
 
 impl ToFromWasmEvent for PrepareItemEnchantEvent {
