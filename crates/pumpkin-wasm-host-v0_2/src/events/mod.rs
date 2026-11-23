@@ -100,8 +100,14 @@ fn get_event_inner<E: Payload + ToFromWasmEvent + 'static>(
     }
 
     let handle = entry.handle.clone();
-    let Some(value) = handle.read::<E>()? else {
-        return Ok(Err(()));
+    // A busy event is a normal "unavailable" result for the plugin, not a trap.
+    let value = match handle.read::<E>() {
+        Ok(Some(value)) => value,
+        Ok(None) => return Ok(Err(())),
+        Err(_) => {
+            tracing::debug!(event = E::get_name_static(), "Event busy, getter refused");
+            return Ok(Err(()));
+        }
     };
     Ok(Ok(value.to_wasm_event(state)))
 }
@@ -132,9 +138,10 @@ fn set_event_inner<E: Payload + ToFromWasmEvent + Clone + 'static>(
                 data.cleanup_event(state);
                 return Ok(Err(()));
             }
-            Err(error) => {
+            Err(_) => {
+                tracing::debug!(event = E::get_name_static(), "Event busy, setter refused");
                 data.cleanup_event(state);
-                return Err(error.into());
+                return Ok(Err(()));
             }
         };
         Box::new(Staged(copy))
