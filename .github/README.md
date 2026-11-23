@@ -114,12 +114,34 @@ These behaviour changes are intentional:
 
 ---
 
+## Separate proposal: faster block placement
+
+Unrelated to the event system, so it's kept as its own small change on top of Pumpkin's `master`: branch [`perf/placement-entity-index`](https://github.com/Stilldrop1/Pumpkin-API-Work/tree/perf/placement-entity-index) ([see the change](https://github.com/Stilldrop1/Pumpkin-API-Work/commit/426873c50)).
+
+**The problem:** every time a player places a block, the server checks *every entity in the world* to see whether one is in the way. With 10,000 mobs, items and minecarts, that means 10,000 checks per block.
+
+**The fix:** use the spatial index Pumpkin already has, so only entities near the block are checked. This is also how vanilla Minecraft does it. It's 9 lines replacing 20, with the same results.
+
+| Entities in world | Before | After | Faster by |
+|---:|---:|---:|---:|
+| 100 | 0.93 µs | 0.11 µs | 8× |
+| 1,000 | 9.2 µs | 0.11 µs | 82× |
+| 10,000 | 86 µs | 0.10 µs | 873× |
+| 50,000 | 429 µs | 0.11 µs | 4,048× |
+
+These are timings for the common case where nothing is blocking the spot. When an entity *is* in the way, the gains are similar unless that entity happens to be first in the server's entity list. In that rare case, the new check costs about 0.1 µs more.
+
+**Tested:** Clippy and format checks pass, and all 868 `pumpkin-core` tests pass on current `master`, including the spatial index's own tests.
+
+---
+
 ## Repository layout
 
 | Branch | Contents |
 |---|---|
 | [`main`](https://github.com/Stilldrop1/Pumpkin-API-Work/tree/main) | PR #4609 + the 9 fixes + this page |
 | [`upstream-pr-4609`](https://github.com/Stilldrop1/Pumpkin-API-Work/tree/upstream-pr-4609) | The original PR, unchanged, for comparison |
+| [`perf/placement-entity-index`](https://github.com/Stilldrop1/Pumpkin-API-Work/tree/perf/placement-entity-index) | Pumpkin `master` + the block placement speed-up |
 
 ## Credit and license
 
