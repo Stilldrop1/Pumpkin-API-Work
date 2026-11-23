@@ -609,26 +609,15 @@ impl BlockRegistry {
     }
 
     fn has_blocking_entity_in_box(world: &World, placed_box: &BoundingBox) -> bool {
-        let players = world.players.load();
-        if players.iter().any(|player| {
-            Self::entity_blocks_block_placement(player.as_ref())
-                && player
-                    .get_entity()
-                    .bounding_box
-                    .load()
-                    .intersects(placed_box)
-        }) {
-            return true;
-        }
-
-        world.entities.load().iter().any(|entity| {
-            Self::entity_blocks_block_placement(entity.as_ref())
-                && entity
-                    .get_entity()
-                    .bounding_box
-                    .load()
-                    .intersects(placed_box)
-        })
+        // The spatial index only visits entities near the box, like vanilla `isUnobstructed`.
+        world
+            .entity_index
+            .query_players(world.players.load_full(), *placed_box)
+            .any(|player| Self::entity_blocks_block_placement(player.as_ref()))
+            || world
+                .entity_index
+                .query(world.entities.load_full(), *placed_box)
+                .any(|entity| Self::entity_blocks_block_placement(entity.as_ref()))
     }
 
     /// Mirrors vanilla `BlockPlaceContext`: where the placed block would go, or `None` when `canPlace()` is false.
