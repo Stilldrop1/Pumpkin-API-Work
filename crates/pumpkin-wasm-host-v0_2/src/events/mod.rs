@@ -1737,11 +1737,12 @@ pub(super) fn take_item_stack(
     state: &mut PluginHostState,
     item: &Resource<pumpkin::plugin::item_stack::ItemStack>,
 ) -> Option<ItemStack> {
-    let stack = state
+    // Copy first so a failed lock leaves the resource in place instead of losing it.
+    let stack = state.get(item).ok()?.try_lock().ok()?.clone();
+    state
         .resource_table
         .delete::<Arc<Mutex<ItemStack>>>(Resource::new_own(item.rep()))
         .ok()?;
-    let stack = stack.try_lock().ok()?.clone();
     Some(stack)
 }
 

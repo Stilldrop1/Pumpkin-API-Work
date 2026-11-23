@@ -226,7 +226,7 @@ where
     fn handle_dyn<'a>(&'a self, server: &'a Arc<Server>, event: QueuedEvent) -> BoxFuture<'a, ()> {
         Box::pin(async move {
             let Some(payload) = event.read_async::<E>().await else {
-                warn!(
+                debug!(
                     event = E::get_name_static(),
                     "Skipping event handler: the event payload is unavailable"
                 );
@@ -275,7 +275,7 @@ where
     fn handle_dyn<'a>(&'a self, server: &'a Arc<Server>, event: QueuedEvent) -> BoxFuture<'a, ()> {
         Box::pin(async move {
             let Some(mut payload) = event.write_async::<E>().await else {
-                warn!(
+                debug!(
                     event = E::get_name_static(),
                     "Skipping event handler: the event payload is unavailable"
                 );
@@ -1638,21 +1638,10 @@ mod tests {
 
         let held = slot.clone().write_owned().await;
         assert!(blocking.read::<ServerTickStartEvent>().is_err());
-        let waiting = tokio::spawn({
-            let blocking = blocking.clone();
-            async move {
-                blocking
-                    .write_async::<ServerTickStartEvent>()
-                    .await
-                    .map(|mut event| {
-                        event.tick = 2;
-                    })
-                    .is_some()
-            }
-        });
-        tokio::task::yield_now().await;
+        let mut waiting = pin!(blocking.write_async::<ServerTickStartEvent>());
+        assert!(futures::poll!(waiting.as_mut()).is_pending());
         drop(held);
-        assert!(waiting.await.unwrap());
+        waiting.await.unwrap().tick = 2;
 
         assert_eq!(
             notification
