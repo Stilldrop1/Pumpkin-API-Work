@@ -116,18 +116,35 @@ trait EventSlot: Send + Sync {
     fn payload_mut(&mut self, handle_generation: u32) -> Option<&mut dyn Payload>;
 }
 
-impl<E: Payload + 'static> EventSlot for (Option<E>, u32) {
+/// The event being dispatched, shared by every handle given out for it.
+struct EventCell<E> {
+    /// Taken back by dispatch once all handlers have finished.
+    event: Option<E>,
+    /// Bumped after each handler phase so older handles stop resolving.
+    generation: u32,
+}
+
+impl<E> EventCell<E> {
+    const fn new(event: E) -> Self {
+        Self {
+            event: Some(event),
+            generation: 0,
+        }
+    }
+}
+
+impl<E: Payload + 'static> EventSlot for EventCell<E> {
     fn payload(&self, handle_generation: u32) -> Option<&dyn Payload> {
-        if handle_generation == self.1 {
-            self.0.as_ref().map(|event| event as &dyn Payload)
+        if handle_generation == self.generation {
+            self.event.as_ref().map(|event| event as &dyn Payload)
         } else {
             None
         }
     }
 
     fn payload_mut(&mut self, handle_generation: u32) -> Option<&mut dyn Payload> {
-        if handle_generation == self.1 {
-            self.0.as_mut().map(|event| event as &mut dyn Payload)
+        if handle_generation == self.generation {
+            self.event.as_mut().map(|event| event as &mut dyn Payload)
         } else {
             None
         }
@@ -1379,10 +1396,10 @@ impl PluginManager {
         event: E,
         handlers: &[Arc<dyn DynEventHandler>],
     ) -> E {
-        let slot = Arc::new(RwLock::new((Some(event), 0u32)));
+        let slot = Arc::new(RwLock::new(EventCell::new(event)));
 
         for handler in handlers.iter().filter(|handler| handler.is_blocking()) {
-            let generation = slot.read().await.1;
+            let generation = slot.read().await.generation;
 
             handler
                 .handle_dyn(
@@ -1395,10 +1412,10 @@ impl PluginManager {
                 )
                 .await;
 
-            slot.write().await.1 += 1;
+            slot.write().await.generation += 1;
         }
 
-        let generation = slot.read().await.1;
+        let generation = slot.read().await.generation;
 
         join_all(
             handlers
@@ -1420,8 +1437,8 @@ impl PluginManager {
 
         let mut slot_guard = slot.write().await;
 
-        slot_guard.1 += 1;
-        slot_guard.0.take().expect("dispatch owns the event")
+        slot_guard.generation += 1;
+        slot_guard.event.take().expect("dispatch owns the event")
     }
 
     /// Returns the event after blocking handlers and notifications have finished.
@@ -1509,7 +1526,7 @@ mod tests {
     async fn queued_event_survives_caller_cancellation() {
         let (submitted, queued) = tokio::sync::oneshot::channel();
         let caller = tokio::spawn(async move {
-            let slot = Arc::new(RwLock::new((Some(ServerTickStartEvent::new(3)), 0u32)));
+            let slot = Arc::new(RwLock::new(EventCell::new(ServerTickStartEvent::new(3))));
             let handle = QueuedEvent {
                 storage: slot.clone(),
                 generation: 0,
@@ -1536,7 +1553,7 @@ mod tests {
 
     #[tokio::test]
     async fn queued_event_shares_edits_and_expires_after_dispatch() {
-        let slot = Arc::new(RwLock::new((Some(ServerTickStartEvent::new(1)), 0u32)));
+        let slot = Arc::new(RwLock::new(EventCell::new(ServerTickStartEvent::new(1))));
         let blocking = QueuedEvent {
             storage: slot.clone(),
             generation: 0,
@@ -1596,7 +1613,7 @@ mod tests {
             3
         );
         drop(guard);
-        assert_eq!(slot.write().await.0.take().unwrap().tick, 3);
+        assert_eq!(slot.write().await.event.take().unwrap().tick, 3);
         assert!(blocking.read::<ServerTickStartEvent>().unwrap().is_none());
         assert!(blocking.write::<ServerTickStartEvent>().unwrap().is_none());
         assert!(blocking.storage.read().await.payload(0).is_none());
@@ -1606,7 +1623,7 @@ mod tests {
     // briefly held the lock or the payload type did not match.
     #[tokio::test]
     async fn queued_event_async_access_waits_for_lock_and_rejects_mismatches() {
-        let slot = Arc::new(RwLock::new((Some(ServerTickStartEvent::new(1)), 0u32)));
+        let slot = Arc::new(RwLock::new(EventCell::new(ServerTickStartEvent::new(1))));
         let blocking = QueuedEvent {
             storage: slot.clone(),
             generation: 0,
@@ -1660,9 +1677,9 @@ mod tests {
 
     #[tokio::test]
     async fn queued_event_invalidates_handles_on_phase_advance() {
-        let slot = Arc::new(RwLock::new((Some(ServerTickStartEvent::new(1)), 0u32)));
+        let slot = Arc::new(RwLock::new(EventCell::new(ServerTickStartEvent::new(1))));
 
-        let blocking_gen = slot.read().await.1;
+        let blocking_gen = slot.read().await.generation;
         assert_eq!(blocking_gen, 0);
         let blocking = QueuedEvent {
             storage: slot.clone(),
@@ -1675,12 +1692,12 @@ mod tests {
             .unwrap()
             .tick = 2;
 
-        slot.write().await.1 += 1;
+        slot.write().await.generation += 1;
 
         assert!(blocking.read::<ServerTickStartEvent>().unwrap().is_none());
         assert!(blocking.write::<ServerTickStartEvent>().unwrap().is_none());
 
-        let notify_gen = slot.read().await.1;
+        let notify_gen = slot.read().await.generation;
         assert_eq!(notify_gen, 1);
         let notification_a = QueuedEvent {
             storage: slot.clone(),
@@ -1716,7 +1733,7 @@ mod tests {
             2
         );
 
-        slot.write().await.1 += 1;
+        slot.write().await.generation += 1;
 
         assert!(
             notification_a
