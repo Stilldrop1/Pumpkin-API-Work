@@ -85,6 +85,29 @@ impl QueuedEvent {
             .ok(),
         )
     }
+
+    /// Waits for shared access to a live event of the requested type.
+    ///
+    /// Returns `None` if the type differs or dispatch has reclaimed the payload.
+    pub async fn read_async<E: Payload + 'static>(&self) -> Option<RwLockReadGuard<'_, E>> {
+        RwLockReadGuard::try_map(self.storage.read().await, |slot| {
+            slot.payload(self.generation)?.downcast_ref()
+        })
+        .ok()
+    }
+
+    /// Waits for exclusive access to a live event for an edit by a blocking handler.
+    ///
+    /// Returns `None` for notifications, a type mismatch, or a reclaimed payload.
+    pub async fn write_async<E: Payload + 'static>(&self) -> Option<RwLockMappedWriteGuard<'_, E>> {
+        if !self.writable {
+            return None;
+        }
+        RwLockWriteGuard::try_map(self.storage.write().await, |slot| {
+            slot.payload_mut(self.generation)?.downcast_mut()
+        })
+        .ok()
+    }
 }
 
 // The erased lock and typed lock both refer to the same allocation.
@@ -185,8 +208,13 @@ where
     /// Asynchronously handles a dynamic event.
     fn handle_dyn<'a>(&'a self, server: &'a Arc<Server>, event: QueuedEvent) -> BoxFuture<'a, ()> {
         Box::pin(async move {
-            let guard = event.read::<E>();
-            let payload = guard.unwrap().unwrap();
+            let Some(payload) = event.read_async::<E>().await else {
+                warn!(
+                    event = E::get_name_static(),
+                    "Skipping event handler: the event payload is unavailable"
+                );
+                return;
+            };
 
             self.handler.handle(server, &*payload).await;
         })
@@ -229,8 +257,13 @@ where
     /// Asynchronously handles a dynamic event.
     fn handle_dyn<'a>(&'a self, server: &'a Arc<Server>, event: QueuedEvent) -> BoxFuture<'a, ()> {
         Box::pin(async move {
-            let guard = event.write::<E>();
-            let mut payload = guard.unwrap().unwrap();
+            let Some(mut payload) = event.write_async::<E>().await else {
+                warn!(
+                    event = E::get_name_static(),
+                    "Skipping event handler: the event payload is unavailable"
+                );
+                return;
+            };
 
             self.handler.handle(server, &mut *payload).await;
         })
@@ -1357,7 +1390,7 @@ impl PluginManager {
                     QueuedEvent {
                         storage: slot.clone(),
                         writable: true,
-                        generation: generation,
+                        generation,
                     },
                 )
                 .await;
@@ -1378,7 +1411,7 @@ impl PluginManager {
                         QueuedEvent {
                             storage: slot.clone(),
                             writable: false,
-                            generation: generation,
+                            generation,
                         },
                     )
                 }),
@@ -1533,39 +1566,96 @@ mod tests {
                 .tick,
             2
         );
-        {
-            let mut guard = blocking.storage.write().await;
-            let event = guard.payload_mut(0).unwrap();
-            event
-                .as_any_mut()
-                .downcast_mut::<ServerTickStartEvent>()
+        let mut guard = blocking.storage.write().await;
+        guard
+            .payload_mut(0)
+            .unwrap()
+            .as_any_mut()
+            .downcast_mut::<ServerTickStartEvent>()
+            .unwrap()
+            .tick = 3;
+        drop(guard);
+
+        let guard = notification.storage.read().await;
+        assert_eq!(
+            guard
+                .payload(0)
                 .unwrap()
-                .tick = 3;
-        }
-        {
-            let guard = notification.storage.read().await;
-            let event = guard.payload(0).unwrap();
-            assert_eq!(
-                event
-                    .as_any()
-                    .downcast_ref::<ServerTickStartEvent>()
-                    .unwrap()
-                    .tick,
-                3
-            );
-            assert_eq!(
-                notification
-                    .read::<ServerTickStartEvent>()
-                    .unwrap()
-                    .unwrap()
-                    .tick,
-                3
-            );
-        }
+                .as_any()
+                .downcast_ref::<ServerTickStartEvent>()
+                .unwrap()
+                .tick,
+            3
+        );
+        assert_eq!(
+            notification
+                .read::<ServerTickStartEvent>()
+                .unwrap()
+                .unwrap()
+                .tick,
+            3
+        );
+        drop(guard);
         assert_eq!(slot.write().await.0.take().unwrap().tick, 3);
         assert!(blocking.read::<ServerTickStartEvent>().unwrap().is_none());
         assert!(blocking.write::<ServerTickStartEvent>().unwrap().is_none());
         assert!(blocking.storage.read().await.payload(0).is_none());
+    }
+
+    // Typed handlers used to `try_*` and unwrap, panicking whenever another accessor
+    // briefly held the lock or the payload type did not match.
+    #[tokio::test]
+    async fn queued_event_async_access_waits_for_lock_and_rejects_mismatches() {
+        let slot = Arc::new(RwLock::new((Some(ServerTickStartEvent::new(1)), 0u32)));
+        let blocking = QueuedEvent {
+            storage: slot.clone(),
+            generation: 0,
+            writable: true,
+        };
+        let notification = QueuedEvent {
+            storage: slot.clone(),
+            generation: 0,
+            writable: false,
+        };
+
+        let held = slot.clone().write_owned().await;
+        assert!(blocking.read::<ServerTickStartEvent>().is_err());
+        let waiting = tokio::spawn({
+            let blocking = blocking.clone();
+            async move {
+                blocking
+                    .write_async::<ServerTickStartEvent>()
+                    .await
+                    .map(|mut event| {
+                        event.tick = 2;
+                    })
+                    .is_some()
+            }
+        });
+        tokio::task::yield_now().await;
+        drop(held);
+        assert!(waiting.await.unwrap());
+
+        assert_eq!(
+            notification
+                .read_async::<ServerTickStartEvent>()
+                .await
+                .unwrap()
+                .tick,
+            2
+        );
+        assert!(
+            notification
+                .write_async::<ServerTickStartEvent>()
+                .await
+                .is_none()
+        );
+        assert!(
+            blocking
+                .read_async::<crate::plugin::events::server::ServerTickEndEvent>()
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
